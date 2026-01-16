@@ -16,7 +16,7 @@ TARGET = os.environ["TG_TARGET"]
 # base64 of session.session (created locally)
 TG_SESSION_B64 = os.environ.get("TG_SESSION_B64", "")
 
-SOURCE_CHANNEL = "air_alert_ua"
+SOURCE_CHANNEL = "SOURCE_CHANNEL = "yabuya"
 
 # Ukraine time for nice timestamps
 UA_TZ = timezone(timedelta(hours=2))
