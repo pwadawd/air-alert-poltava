@@ -16,7 +16,7 @@ BOT_TOKEN = os.environ["TG_BOT_TOKEN"]
 TARGET = os.environ["TG_TARGET"]
 
 # source channel username (without @). default: air_alert_ua
-SOURCE_CHANNEL = os.environ.get("TG_SOURCE", "yabuya")
+SOURCE_CHANNEL = os.environ.get("TG_SOURCE", "awedfadadawfdagerewsgfqaqaw")
 
 # base64 of session.session (created locally)
 TG_SESSION_B64 = os.environ.get("TG_SESSION_B64", "")
