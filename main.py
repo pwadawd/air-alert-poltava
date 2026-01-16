@@ -7,6 +7,7 @@ import html
 import requests
 from datetime import datetime, timezone, timedelta
 from telethon import TelegramClient, events
+print("=== VERSION: 2026-01-16 17:00 TEST ===")
 
 # ------------------ ENV ------------------
 API_ID = int(os.environ["TG_API_ID"])
