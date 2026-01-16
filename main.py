@@ -16,7 +16,7 @@ BOT_TOKEN = os.environ["TG_BOT_TOKEN"]
 TARGET = os.environ["TG_TARGET"]
 
 # source channel username (without @). default: air_alert_ua
-SOURCE_CHANNEL = os.environ.get("TG_SOURCE", "awedfadadawfdagerewsgfqaqaw")
+SOURCE_CHANNEL = os.environ.get("TG_SOURCE", "air_alert_ua")
 
 # base64 of session.session (created locally)
 TG_SESSION_B64 = os.environ.get("TG_SESSION_B64", "")
@@ -29,7 +29,7 @@ ALL_DISTRICTS = ["Полтавський", "Кременчуцький", "Мир
 
 DISTRICT_PATTERNS = {
     "Полтавський": re.compile(r"полтав", re.I),
-    "Кременчуцький": re.compile(r"кременчук|кременчуг", re.I),
+    "Кременчуцький": re.compile(r"кременчуц|кременчуг", re.I),
     "Миргородський": re.compile(r"миргород", re.I),
     "Лубенський": re.compile(r"лубн|лубен", re.I),
 }
