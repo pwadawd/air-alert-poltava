@@ -2,142 +2,227 @@ import os
 import re
 import asyncio
 import base64
+import time
+import html
 from datetime import datetime, timezone, timedelta
 
+import requests
+from flask import Flask
 from telethon import TelegramClient, events
-from telethon.sessions import StringSession
 
 # ---------------- ENV ----------------
 API_ID = int(os.environ["TG_API_ID"])
 API_HASH = os.environ["TG_API_HASH"]
 
-# Bot token used ONLY for sending (optional; can also send from user)
-BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
+# куда постить (можно @username без @, или -100... id)
+TARGET = os.environ["TG_TARGET"]
 
-# Where to post results: channel/group username WITHOUT @ (e.g. poltavaRanger) or numeric id
-TARGET = os.environ["TG_TARGET"].strip()
+# откуда читать (публичный канал, username без @)
+SOURCE_CHANNEL = os.environ.get("TG_SOURCE", "air_alert_ua")
 
-# Source channel username WITHOUT @ (e.g. air_alert_ua)
-SOURCE_CHANNEL = os.environ.get("TG_SOURCE", "air_alert_ua").strip().lstrip("@")
-
-# base64 of Telethon .session file -> used to start as USER
+# base64 от бинарного session.session (сделанного локально)
 TG_SESSION_B64 = os.environ.get("TG_SESSION_B64", "").strip()
 
-UA_TZ = timezone(timedelta(hours=2))
+UA_TZ = timezone(timedelta(hours=2))  # зимой +2, летом будет +3, но для текста не критично
 
-# ---- District patterns (fix Kremenchuk) ----
-DISTRICT_PATTERNS = {
-    "Полтавський": re.compile(r"полтав", re.I),
-    "Кременчуцький": re.compile(r"кременчук|кременчуг|кременчуц|кременчуць", re.I),
-    "Миргородський": re.compile(r"миргород", re.I),
-    "Лубенський": re.compile(r"лубн|лубен", re.I),
-}
+# ---------------- KEEPALIVE WEB (Render Web Service) ----------------
+app = Flask(__name__)
 
-# ---------------- helpers ----------------
-def now_ua() -> datetime:
-    return datetime.now(tz=UA_TZ)
+@app.get("/")
+def home():
+    return "OK"
 
-def fmt_hhmm(dt: datetime) -> str:
-    return dt.strftime("%H:%M")
+def run_web():
+    port = int(os.environ.get("PORT", "10000"))
+    # Render смотрит на PORT
+    app.run(host="0.0.0.0", port=port)
 
-def is_alert(text: str) -> bool:
-    t = text.lower()
-    return ("повітряна тривога" in t) or ("повітряна трив" in t) or ("🔴" in t)
+# ---------------- SESSION RESTORE ----------------
+SESSION_PATH = "session.session"
 
-def is_all_clear(text: str) -> bool:
-    t = text.lower()
-    return ("відбій" in t) or ("🟩" in t)
-
-def detect_districts(text: str):
-    found = []
-    for name, rx in DISTRICT_PATTERNS.items():
-        if rx.search(text):
-            found.append(name)
-    return found
-
-async def resolve_entity(client: TelegramClient, value: str):
+def ensure_session_file():
     """
-    value can be username (without @) or numeric id.
+    Восстанавливает session.session из TG_SESSION_B64.
+    НИКАКОГО UTF-8 decode — это бинарь.
     """
-    v = value.strip()
-    if re.fullmatch(r"-?\d+", v):
-        return int(v)
-    return await client.get_entity(v.lstrip("@"))
-
-async def send_text(user_client: TelegramClient, bot_client: TelegramClient | None, target_entity, text: str):
-    # Prefer bot if token provided, else send from user session
-    if bot_client is not None:
-        await bot_client.send_message(target_entity, text, link_preview=False)
-    else:
-        await user_client.send_message(target_entity, text, link_preview=False)
-
-# ---------------- main ----------------
-async def main():
-    # 1) USER client (must work on Render, no prompts)
     if not TG_SESSION_B64:
-        raise RuntimeError("TG_SESSION_B64 is empty. Upload your session.b64 into Render env var TG_SESSION_B64")
+        raise RuntimeError("TG_SESSION_B64 is empty. Put base64 from session.session into env.")
 
     try:
-        session_bytes = base64.b64decode(TG_SESSION_B64.encode("utf-8"))
-        session_str = session_bytes.decode("utf-8", errors="strict")
+        raw = base64.b64decode(TG_SESSION_B64, validate=True)
     except Exception as e:
-        raise RuntimeError(f"TG_SESSION_B64 decode failed: {e}")
+        raise RuntimeError(f"TG_SESSION_B64 base64 decode failed: {e}")
 
-    user = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+    # простая проверка на адекватный размер
+    if len(raw) < 500:
+        raise RuntimeError(f"TG_SESSION_B64 decoded too small ({len(raw)} bytes). Wrong base64?")
 
-    # 2) Optional BOT client for sending
-    bot = None
-    if BOT_TOKEN:
-        bot = TelegramClient("bot_sender", API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+    # перезаписываем файл каждый старт — так надежнее
+    with open(SESSION_PATH, "wb") as f:
+        f.write(raw)
 
-    await user.start()
-    me = await user.get_me()
-    print(f"[AUTH] USER OK: id={me.id} username={getattr(me, 'username', None)}")
+# ---------------- PARSING ----------------
+DISTRICT_PATTERNS = {
+    "Лубенський": re.compile(r"\bлубен", re.I),
+    "Миргородський": re.compile(r"\bмиргород", re.I),
+    "Полтавський": re.compile(r"\bполтав", re.I),
 
-    if bot is not None:
-        bme = await bot.get_me()
-        print(f"[AUTH] BOT OK: id={bme.id} username={getattr(bme, 'username', None)}")
+    # фикс Кременчуцький (часто ломается из-за ё/е/і/у/ь/апострофов)
+    "Кременчуцький": re.compile(r"\bкременчук|\bкременчуц", re.I),
+}
 
-    # Resolve entities
-    source_entity = await resolve_entity(user, SOURCE_CHANNEL)
-    target_entity = await resolve_entity(user, TARGET)
-    print(f"[CFG] SOURCE={SOURCE_CHANNEL} -> {source_entity}")
-    print(f"[CFG] TARGET={TARGET} -> {target_entity}")
+ALERT_RE = re.compile(r"(повітрян\w*\s+тривог\w*)", re.I)
+CLEAR_RE = re.compile(r"(відб\w*\s+тривог\w*)", re.I)
 
-    async def process_text(text: str):
-        # DEBUG входящего текста
-        print("IN:", (text or "")[:160].replace("\n", " "))
+def now_ua_str():
+    return datetime.now(UA_TZ).strftime("%H:%M")
 
-        districts = detect_districts(text or "")
-        if not districts:
-            # Если не нашли район — просто игнор
+def extract_districts(text: str):
+    t = text.lower()
+    found = []
+    for name, rx in DISTRICT_PATTERNS.items():
+        if rx.search(t):
+            found.append(name)
+    # если в тексте список буллетами, попробуем вытащить прям "• ... район"
+    # и сопоставить по словам
+    bullets = re.findall(r"•\s*([^\n#]+)", text)
+    for b in bullets:
+        bl = b.lower()
+        for name, rx in DISTRICT_PATTERNS.items():
+            if name not in found and rx.search(bl):
+                found.append(name)
+    return found
+
+def is_alert(text: str) -> bool:
+    return bool(ALERT_RE.search(text))
+
+def is_clear(text: str) -> bool:
+    return bool(CLEAR_RE.search(text))
+
+def format_message(kind: str, districts: list[str], extra_line: str | None = None):
+    # kind: "alert" or "clear"
+    if kind == "alert":
+        title = "<b>Повітряна тривога</b>"
+        dot = "🔴"
+    else:
+        title = "<b>Відбій тривоги</b>"
+        dot = "🟩"
+
+    lines = [f"{dot} {now_ua_str()} {title}"]
+    if districts:
+        lines.append("📍 Райони:")
+        for d in districts:
+            lines.append(f"• {html.escape(d)} район")
+    if extra_line:
+        lines.append(extra_line)
+    return "\n".join(lines)
+
+# ---------------- AGGREGATION (отбои) ----------------
+CLEAR_AGG_WINDOW_SEC = 5       # если отбои пришли быстро — склеиваем
+CLEAR_ALL_WINDOW_SEC = 120     # если все отбои за 2 минуты — "везде отбой"
+
+ALL_DISTRICTS = list(DISTRICT_PATTERNS.keys())
+
+clear_buffer = {
+    "ts_first": None,   # float
+    "districts": set(), # set[str]
+}
+
+def reset_clear_buffer():
+    clear_buffer["ts_first"] = None
+    clear_buffer["districts"] = set()
+
+async def flush_clear_if_needed(send_func):
+    """
+    Если накопили отбои и окно прошло — отправить.
+    """
+    if clear_buffer["ts_first"] is None:
+        return
+
+    age = time.time() - clear_buffer["ts_first"]
+    if age < CLEAR_AGG_WINDOW_SEC:
+        return
+
+    districts = sorted(clear_buffer["districts"], key=lambda x: ALL_DISTRICTS.index(x) if x in ALL_DISTRICTS else 999)
+    # если все районы закрылись за 2 минуты — общий отбой
+    age_all = time.time() - clear_buffer["ts_first"]
+    if set(districts) >= set(ALL_DISTRICTS) and age_all <= CLEAR_ALL_WINDOW_SEC:
+        msg = format_message("clear", [], extra_line="✅ В усіх районах області — відбій.")
+    else:
+        msg = format_message("clear", districts)
+
+    await send_func(msg)
+    reset_clear_buffer()
+
+# ---------------- MAIN ----------------
+async def main():
+    ensure_session_file()
+
+    client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
+
+    await client.connect()
+    if not await client.is_user_authorized():
+        # если сессия битая — сразу скажем
+        raise RuntimeError("Session is not authorized. Recreate session.session locally and update TG_SESSION_B64.")
+
+    # Проверим доступ к источнику
+    src_entity = await client.get_input_entity(SOURCE_CHANNEL)
+
+    async def send_to_target(text_html: str):
+        # send_message поддерживает parse_mode через html=True? В telethon это parse_mode='html'
+        await client.send_message(TARGET, text_html, parse_mode="html")
+
+    # таймер, чтобы периодически флашить буфер отбоя
+    async def buffer_watcher():
+        while True:
+            try:
+                await flush_clear_if_needed(send_to_target)
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+
+    asyncio.create_task(buffer_watcher())
+
+    @client.on(events.NewMessage(chats=src_entity))
+    async def handler(event):
+        text = event.raw_text or ""
+        # игнор пустых/сервисных
+        if len(text.strip()) < 3:
             return
 
-        t = now_ua()
+        districts = extract_districts(text)
+        # если не нашли районы — не спамим
+        if not districts:
+            return
+
         if is_alert(text):
-            header = "**🟥 ПОВІТРЯНА ТРИВОГА**"
-            body = "\n".join([f"• {d} район" for d in districts])
-            msg = f"{header}\n\n📍 Райони:\n{body}\n\nЧас початку тривоги: {fmt_hhmm(t)}"
-            await send_text(user, bot, target_entity, msg)
-            print("[OUT] alert sent")
+            # перед тревогой — если в буфере были отбои, отправим их
+            await flush_clear_if_needed(send_to_target)
 
-        elif is_all_clear(text):
-            header = "**🟩 ВІДБІЙ ТРИВОГИ**"
-            body = "\n".join([f"• {d} район" for d in districts])
-            msg = f"{header}\n\n📍 Райони:\n{body}\n\nЧас закінчення тривоги: {fmt_hhmm(t)}"
-            await send_text(user, bot, target_entity, msg)
-            print("[OUT] clear sent")
+            msg = format_message("alert", districts, extra_line="Слідкуйте за подальшими повідомленнями.")
+            await send_to_target(msg)
+            return
 
-    @user.on(events.NewMessage(chats=source_entity))
-    async def on_new(event):
-        await process_text(event.raw_text)
+        if is_clear(text):
+            # копим отбои 5 секунд, чтобы склеить
+            if clear_buffer["ts_first"] is None:
+                clear_buffer["ts_first"] = time.time()
 
-    @user.on(events.MessageEdited(chats=source_entity))
-    async def on_edit(event):
-        await process_text(event.raw_text)
+            for d in districts:
+                clear_buffer["districts"].add(d)
 
-    print("[RUN] Listening...")
-    await user.run_until_disconnected()
+            # если уже все районы закрылись — можно отправлять сразу, не ждать 5 сек
+            if clear_buffer["districts"] >= set(ALL_DISTRICTS):
+                await flush_clear_if_needed(send_to_target)
+
+            return
+
+    print("RUNNING: listening source =", SOURCE_CHANNEL, "-> target =", TARGET)
+    await client.run_until_disconnected()
 
 if __name__ == "__main__":
+    # На Render Web Service нужен порт — запускаем Flask в отдельном треде
+    import threading
+    threading.Thread(target=run_web, daemon=True).start()
+
     asyncio.run(main())
